@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Установка testnavi</title>
+<style>
+  body { font-family: sans-serif; max-width: 560px; margin: 40px auto; padding: 0 16px; }
+  button { font-size: 18px; padding: 12px 20px; }
+  #log { white-space: pre-wrap; background: #111; color: #0f0; padding: 12px; margin-top: 16px; min-height: 140px; font-size: 13px; }
+</style>
+</head>
+<body>
+<h2>Установка testnavi на ГУ</h2>
+<p>Подключите ГУ к компьютеру по USB (в Chrome или Edge). На ГУ включите отладку по USB и подтвердите ключ на экране.</p>
+<button id="go">Подключить и установить</button>
+<div id="log">Загружаю библиотеки...</div>
+
+<script type="module">
+const logEl = document.getElementById("log");
+const log = (m) => { logEl.textContent += "\n" + m; };
+const REMOTE = "/data/local/tmp/testnavi.apk";
+
+// Всё тяжёлое грузим заранее, при открытии страницы
+const withTimeout = (p, ms, what) => Promise.race([
+  p,
+  new Promise((_, rej) => setTimeout(() => rej(new Error("таймаут: " + what + " дольше " + ms / 1000 + " с")), ms)),
+]);
+
+let lib = null;
+let apkBlob = null;
+const ready = (async () => {
+  try {
+    const dev = await import("https://esm.sh/@yume-chan/adb-daemon-webusb@0.0.20");
+    const adb = await import("https://esm.sh/@yume-chan/adb@0.0.20");
+    const cred = await import("https://esm.sh/@yume-chan/adb-credential-web@0.0.20");
+    const Store = cred.AdbWebCredentialStore ?? cred.default;
+    lib = {
+      Manager: dev.AdbDaemonWebUsbDeviceManager,
+      Adb: adb.Adb,
+      Transport: adb.AdbDaemonTransport,
+      Store,
+      credKeys: Object.keys(cred),
+    };
+    log("Библиотеки загружены.");
+    const res = await fetch("./testnavi.apk", { cache: "no-store" });
+    if (!res.ok) throw new Error("testnavi.apk не найден на сайте (HTTP " + res.status + ")");
+    apkBlob = await res.blob();
+    log("APK готов: " + Math.round(apkBlob.size / 1024) + " КБ. Можно нажимать кнопку.");
+  } catch (e) {
+    log("Ошибка загрузки: " + (e && e.message ? e.message : e));
+  }
+})();
+
+document.getElementById("go").addEventListener("click", run);
+
+async function run() {
+  // requestDevice должен быть первым действием после нажатия
+  if (!window.isSecureContext) return log("Нужен HTTPS.");
+  if (!navigator.usb) return log("Этот браузер не поддерживает WebUSB. Откройте в Chrome или Edge на компьютере.");
+  if (!lib || !apkBlob) return log("Ещё загружаюсь, подождите секунду и нажмите снова.");
+
+  logEl.textContent = "";
+  try {
+    const manager = new lib.Manager(navigator.usb);
+    const device = await manager.requestDevice();
+    if (!device) return log("Устройство не выбрано.");
+
+    if (typeof lib.Store !== "function") {
+      return log("Класс AdbWebCredentialStore не найден. Экспорт модуля: " + lib.credKeys.join(", "));
+    }
+
+    const connection = await device.connect();
+    const transport = await lib.Transport.authenticate({
+      serial: device.serial,
+      connection,
+      credentialStore: new lib.Store("testnavi-installer"),
+    });
+    const adb = new lib.Adb(transport);
+    log("Подключено: " + device.serial);
+
+    log("Открываю канал передачи файлов...");
+    const sync = await withTimeout(adb.sync(), 30000, "открытие канала передачи");
+    log("Канал открыт. Заливаю APK на ГУ (" + Math.round(apkBlob.size / 1024) + " КБ)...");
+
+    const total = apkBlob.size;
+    const reader = apkBlob.stream().getReader();
+    let sent = 0;
+    let lastPct = -10;
+    const progressStream = new ReadableStream({
+      async pull(controller) {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          log("Все данные отправлены, жду ответа ГУ...");
+          return;
+        }
+        sent += value.byteLength;
+        const pct = Math.floor(sent * 100 / total);
+        if (pct >= lastPct + 10) { lastPct = pct; log("Передано " + pct + "%"); }
+        controller.enqueue(value);
+      }
+    });
+    await withTimeout(
+      sync.write({ filename: REMOTE, file: progressStream, permission: 0o644, mtime: Date.now() }),
+      120000, "запись APK на ГУ"
+    );
+    await sync.dispose();
+    log("Файл записан на ГУ.");
+
+    log("Устанавливаю...");
+    const out = await withTimeout(
+      adb.subprocess.noneProtocol.spawnWaitText(`pm install -r ${REMOTE}`),
+      300000, "pm install"
+    );
+    log(out.trim());
+
+    await adb.subprocess.noneProtocol.spawnWaitText(`rm -f ${REMOTE}`);
+    log("Установочный файл с ГУ удалён. Готово.");
+  } catch (e) {
+    log("Ошибка: " + (e && e.message ? e.message : e));
+  }
+}
+</script>
+</body>
+</html>
